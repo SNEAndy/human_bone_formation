@@ -12,9 +12,10 @@ from dataset.dataset import get_dataloader, transform
 from dataset.format import id_to_name
 from dataset.sampler import SamplerMix
 from models.multimodel import create_model
-
+# from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, LambdaLR
 from dataset.exporter import Exporter
-
+from jittor.lr_scheduler import CosineAnnealingLR
+from models.metrics import J2J
 # Set Jittor flags
 jt.flags.use_cuda = 1
 
@@ -73,7 +74,12 @@ def train(args):
         sampler=SamplerMix(num_samples=1024, vertex_samples=512),
         transform=transform,
     )
-    
+    t_total = len(train_loader) * args.epochs
+    # WARMUP_RATIO = 0.1
+    # warmup_steps = int(WARMUP_RATIO * total_steps)
+
+    T_mult = 1
+    scheduler = CosineAnnealingLR(optimizer,t_total)
     if args.val_data_list:
         val_loader = get_dataloader(
             data_root=args.data_root,
@@ -89,6 +95,7 @@ def train(args):
     
     # Training loop
     best_loss = 99999999
+    total_val_loss=0.0
     for epoch in range(args.epochs):
         # Training phase
         model.train()
@@ -114,7 +121,7 @@ def train(args):
             optimizer.zero_grad()
             optimizer.backward(loss)
             optimizer.step()
-            
+            scheduler.step()
             # Calculate statistics
             train_loss_mse += loss_mse.item()
             train_loss_l1 += loss_l1.item()
@@ -135,7 +142,7 @@ def train(args):
                    f"Train Loss l1: {train_loss_l1:.4f} "
                     f"Train Loss skl: {train_loss_skl:.4f} "
                    f"Time: {epoch_time:.2f}s "
-                   f"LR: {optimizer.lr:.6f}")
+                   f"LR: {scheduler.base_lr}")
 
         # Validation phase
         if val_loader is not None and (epoch + 1) % args.val_freq == 0:
@@ -143,6 +150,7 @@ def train(args):
             val_loss_mse = 0.0
             val_loss_l1 = 0.0
             val_loss_skl=0.0
+            J2J_loss = 0.0
             show_id = np.random.randint(0, len(val_loader))
             for batch_idx, data in enumerate(val_loader):
                 # Get data and labels
@@ -154,7 +162,8 @@ def train(args):
                 loss_skl = criterion_skl(outputs2, joints_loss)
                 loss_mse = criterion_mse(outputs1, skin)
                 loss_l1 = criterion_l1(outputs1, skin)
-                
+                for i in range(outputs2.shape[0]):
+                    J2J_loss += J2J(outputs2[i].reshape(-1, 3), joints[i].reshape(-1, 3)).item() / outputs2.shape[0]
                 # export render results(which is slow, so you can turn it off)
                 if batch_idx == show_id:
                     exporter = Exporter()
@@ -172,14 +181,16 @@ def train(args):
             val_loss_mse /= len(val_loader)
             val_loss_l1 /= len(val_loader)
             val_loss_skl/=len(val_loader)
-            log_message(f"Validation Loss: mse: {val_loss_mse:.4f} l1: {val_loss_l1:.4f}  skl: {val_loss_skl:.4f}")
+            J2J_loss /= len(val_loader)
+            total_val_loss=val_loss_mse+val_loss_l1+val_loss_skl+J2J_loss
+            log_message(f"Validation Loss: mse: {val_loss_mse:.4f} l1: {val_loss_l1:.4f}  skl: {val_loss_skl:.4f} J2J Loss: {J2J_loss:.4f}")
             
             # Save best model
-            if val_loss_l1 < best_loss:
-                best_loss = val_loss_l1
+            if total_val_loss < best_loss:
+                best_loss = total_val_loss
                 model_path = os.path.join(args.output_dir, 'best_model.pkl')
                 model.save(model_path)
-                log_message(f"Saved best model with l1 loss {best_loss:.4f} to {model_path}")
+                log_message(f"Saved best model with lowest loss {best_loss:.4f} to {model_path}")
         
         # Save checkpoint
         if (epoch + 1) % args.save_freq == 0:
